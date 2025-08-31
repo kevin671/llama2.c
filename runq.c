@@ -452,7 +452,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // Online Hadamard transform
-        matmul_hadU(s->xb, dim); // Hadamard transform
+        matmul_hadU(s->xb, dim);
 
         // final matmul to get the output of the attention
         quantize(&s->xq, s->xb, dim);
@@ -483,7 +483,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // Online Hadamard transform
-        matmul_hadU(s->hb, hidden_dim); // Hadamard transform
+        matmul_hadU(s->hb, hidden_dim);
 
         // final matmul to get the output of the ffn
         quantize(&s->hq, s->hb, hidden_dim);
