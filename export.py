@@ -14,12 +14,14 @@ Among the "output" versions of .bin files:
 
 This script aspires to provide all of these conversions.
 """
-import os
+
+import argparse
 import gzip
+import json
+import os
 import shutil
 import struct
-import argparse
-import json
+import typing
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +30,113 @@ from torch import nn
 
 from model import ModelArgs, Transformer
 
+# -----------------------------------------------------------------------------
+# https://github.com/spcl/QuaRot
+
+
+def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
+    """
+    fuse the linear operations in Layernorm into the adjacent linear blocks.
+    """
+    for linear in linear_layers:
+        linear_dtype = linear.weight.dtype
+
+        # Calculating new weight and bias
+        W_ = linear.weight.data.double()
+        linear.weight.data = (W_ * layernorm.weight.double()).to(linear_dtype)
+
+        if hasattr(layernorm, "bias"):
+            if linear.bias is None:
+                linear.bias = torch.nn.Parameter(torch.zeros(linear.out_features, dtype=torch.float64))
+            # RMSNorm does not have bias
+            # linear.bias.data = linear.bias.data.double() + torch.matmul(W_, layernorm.bias.double())
+            # linear.bias.data = linear.bias.data.to(linear_dtype)
+
+
+def fuse_layer_norms(model):
+    # RMSNorm used, no embedding centering needed
+    # Embedding fusion
+    # W = model.model.embed_tokens
+    # W_ = W.weight.data.double()
+    # W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
+
+    # Fuse the linear operations in Layernorm into the adjacent linear blocks.
+    for layer in model.layers:
+        # fuse the input layernorms into the linear layers
+        fuse_ln_linear(layer.ffn_norm, [layer.feed_forward.w1, layer.feed_forward.w3])
+        fuse_ln_linear(layer.attention_norm, [layer.attention.wq, layer.attention.wk, layer.attention.wv])
+
+    fuse_ln_linear(model.model.norm, [model.lm_head])
+
+
+def is_pow2(n):
+    return (n & (n - 1) == 0) and (n > 0)
+
+
+def matmul_hadU(X):
+    n = X.shape[-1]
+    assert is_pow2(n)
+    K = 1
+    # hadK, K = get_hadK(n, transpose)
+    input = X.clone().view(-1, n, 1)
+    output = input.clone()
+    while input.shape[1] > K:
+        input = input.view(input.shape[0], input.shape[1] // 2, 2, input.shape[2])
+        output = output.view(input.shape)
+        output[:, :, 0, :] = input[:, :, 0, :] + input[:, :, 1, :]
+        output[:, :, 1, :] = input[:, :, 0, :] - input[:, :, 1, :]
+        output = output.view(input.shape[0], input.shape[1], -1)
+        (input, output) = (output, input)
+    del output
+
+    # if K > 1:
+    # Do not explicitly repeat - OOM
+    # input = torch.bmm(
+    #     hadK.repeat(len(input), 1, 1).to(input.device).to(input.dtype), input)
+    # Use bcast instead
+    # input = hadK.view(1, K, K).to(input) @ input
+
+    return input.view(X.shape) / torch.tensor(n).sqrt()
+
+
+def random_hadamard_matrix(size, device):
+    # See https://cornell-relaxml.github.io/quip-sharp/ , Section "Randomized Hadamard Transformation"
+    Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
+    Q = Q * 2 - 1
+    Q = torch.diag(Q)
+    return matmul_hadU(Q).to(device)
+
+
+def rotate_model(model):
+    Q = random_hadamard_matrix(model.config.hidden_size, model.device)
+    config = model.config
+    num_heads = config.num_attention_heads
+    model_dim = config.hidden_size
+    head_dim = model_dim // num_heads
+
+    # rotate_embeddings(model, Q)
+    model.tok_embeddings.weight.data = torch.matmul(model.tok_embeddings.weight.data, Q)
+    # rotate_head(model, Q)
+    model.output.weight.data = torch.matmul(Q.T, model.output.weight.data)
+    for layer in model.layers:
+        # rotate_attention_inputs(layers[idx], Q)
+        layer.attention.wq.weight.data = torch.matmul(layer.attention.wq.weight.data, Q)
+        layer.attention.wk.weight.data = torch.matmul(layer.attention.wk.weight.data, Q)
+        layer.attention.wv.weight.data = torch.matmul(layer.attention.wv.weight.data, Q)
+        # rotate_attention_output(layers[idx], Q)
+        layer.attention.wo.weight.data = torch.matmul(Q.T, layer.attention.wo.weight.data)
+        # rotate_mlp_input(layers[idx], Q)
+        layer.feed_forward.w1.weight.data = torch.matmul(layer.feed_forward.w1.weight.data, Q)
+        layer.feed_forward.w3.weight.data = torch.matmul(layer.feed_forward.w3.weight.data, Q)
+        # rotate_mlp_output(layers[idx], Q)
+        layer.feed_forward.w2.weight.data = matmul_hadU(layer.feed_forward.w2.weight.data.T).T
+        layer.feed_forward.w2.weight.data = torch.matmul(Q.T, layer.feed_forward.w2.weight.data)
+        # rotate_ov_proj(layers[idx], num_heads, head_dim)
+        layer.attention.wv.weight.data = matmul_hadU(layer.attention.wv.weight.data.T).T
+        layer.attention.wo.weight.data = matmul_hadU(layer.attention.wo.weight.data.T).T
+
+
+# fmt: off
 # -----------------------------------------------------------------------------
 # common utilities
 
@@ -188,6 +297,10 @@ def version2_export(model, filepath, group_size=64):
     - quantization is done in groups of group_size to reduce the effects of any outliers
     """
     version = 2
+
+    fuse_layer_norms(model)
+    rotate_model(model)
+    print("QuaRot: fused layer norms and applied random rotation to model weights")
 
     # let's first do some validation for this export type
     while model.params.dim % group_size != 0:
@@ -565,3 +678,4 @@ if __name__ == "__main__":
 
     # export
     model_export(model, args.filepath, args.version, args.dtype)
+# fmt: on
