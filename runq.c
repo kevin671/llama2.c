@@ -134,6 +134,24 @@ void free_run_state(RunState* s) {
 }
 
 // ----------------------------------------------------------------------------
+// QuaRot utilities
+
+// FWHT on a length-n vector (in-place)
+void matmul_hadU(float *x, int n) {
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float u = x[j];
+                float v = x[j + h];
+                x[j]     = u + v;
+                x[j + h] = u - v;
+            }
+        }
+    }
+}
+
+
+// ----------------------------------------------------------------------------
 // Quantization functions
 
 void dequantize(QuantizedTensor *qx, float* x, int n) {
@@ -433,6 +451,9 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
+        // Online Hadamard transform
+        matmul_hadU(s->xb, dim); // Hadamard transform
+
         // final matmul to get the output of the attention
         quantize(&s->xq, s->xb, dim);
         matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
@@ -460,6 +481,9 @@ float* forward(Transformer* transformer, int token, int pos) {
             val *= s->hb2[i];
             s->hb[i] = val;
         }
+
+        // Online Hadamard transform
+        matmul_hadU(s->hb, hidden_dim); // Hadamard transform
 
         // final matmul to get the output of the ffn
         quantize(&s->hq, s->hb, hidden_dim);
