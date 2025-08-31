@@ -134,6 +134,24 @@ void free_run_state(RunState* s) {
 }
 
 // ----------------------------------------------------------------------------
+// QuaRot utilities
+
+// FWHT on a length-n vector (in-place)
+void matmul_hadU(float *x, int n) {
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float u = x[j];
+                float v = x[j + h];
+                x[j]     = u + v;
+                x[j + h] = u - v;
+            }
+        }
+    }
+}
+
+
+// ----------------------------------------------------------------------------
 // Quantization functions
 
 void dequantize(QuantizedTensor *qx, float* x, int n) {
@@ -386,6 +404,14 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
+        // online Hadamard transform
+        for (int i = 0; i < dim; i += head_size) {
+            matmul_hadU(s->q + i, head_size);
+        }
+        for (int i = 0; i < kv_dim; i += head_size) {
+            matmul_hadU(s->k + i, head_size);
+        }
+
         // save key,value at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         float* key_cache_row = s->key_cache + loff + pos * kv_dim;
@@ -433,6 +459,9 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
+        // online Hadamard transform
+        matmul_hadU(s->xb, dim);
+
         // final matmul to get the output of the attention
         quantize(&s->xq, s->xb, dim);
         matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
@@ -460,6 +489,9 @@ float* forward(Transformer* transformer, int token, int pos) {
             val *= s->hb2[i];
             s->hb[i] = val;
         }
+
+        // online Hadamard transform
+        matmul_hadU(s->hb, hidden_dim);
 
         // final matmul to get the output of the ffn
         quantize(&s->hq, s->hb, hidden_dim);
