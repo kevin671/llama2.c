@@ -404,6 +404,14 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
+        // online Hadamard transform
+        for (int i = 0; i < dim; i += head_size) {
+            matmul_hadU(s->q + i, head_size);
+        }
+        for (int i = 0; i < kv_dim; i += head_size) {
+            matmul_hadU(s->k + i, head_size);
+        }
+
         // save key,value at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         float* key_cache_row = s->key_cache + loff + pos * kv_dim;
@@ -451,7 +459,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        // Online Hadamard transform
+        // online Hadamard transform
         matmul_hadU(s->xb, dim);
 
         // final matmul to get the output of the attention
@@ -482,7 +490,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             s->hb[i] = val;
         }
 
-        // Online Hadamard transform
+        // online Hadamard transform
         matmul_hadU(s->hb, hidden_dim);
 
         // final matmul to get the output of the ffn
