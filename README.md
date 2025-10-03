@@ -12,6 +12,14 @@ As the architecture is identical, you can also load and inference Meta's Llama 2
 
 Please note that this repo started recently as a fun weekend project: I took my earlier [nanoGPT](https://github.com/karpathy/nanoGPT), tuned it to implement the Llama-2 architecture instead of GPT-2, and the meat of it was writing the C inference engine in [run.c](run.c). So the project is young and moving quickly. Hat tip to the awesome [llama.cpp](https://github.com/ggerganov/llama.cpp) for inspiring this project. Compared to llama.cpp, I wanted something super simple, minimal, and educational so I chose to hard-code the Llama 2 architecture and just roll one inference file of pure C with no dependencies.
 
+## Quarot
+
+```
+make run_quarot
+python export.py tinytinystories.bin --version 3 --checkpoint tinytinystories44K.pt
+./run_quarot tinytinystories.bin -z tinytinystories_tokenizer.bin -t 0.0 -n 256 -i "One day, a little girl named Lily found a needle in her room"
+```
+
 ## feel the magic
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/karpathy/llama2.c/blob/master/run.ipynb)
