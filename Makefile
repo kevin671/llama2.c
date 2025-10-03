@@ -14,6 +14,10 @@ rundebug: run.c
 	$(CC) -g -o run run.c -lm
 	$(CC) -g -o runq runq.c -lm
 
+.PHONY: run_quarot
+run_quarot: run_quarot.c
+	$(CC) -O3 -o run_quarot run_quarot.c -lm
+
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
 # -Ofast enables all -O3 optimizations.

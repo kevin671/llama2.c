@@ -259,6 +259,133 @@ def version2_export(model, filepath, group_size=64):
     out_file.close()
     print(f"wrote {filepath}")
 
+
+def version3_export(model, filepath, group_size=64):
+    """
+    Export the model weights in Q8_0 into .bin file to be read from C.
+    That is:
+    - quantize all weights to symmetric int8, in range [-127, 127]
+    - all other tensors (the rmsnorm params) are kept and exported in fp32
+    - quantization is done in groups of group_size to reduce the effects of any outliers
+    """
+    version = 3
+
+    # let's first do some validation for this export type
+    while model.params.dim % group_size != 0:
+        group_size //= 2
+        print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+
+    # write
+    out_file = open(filepath, 'wb')
+    # first write out the header. the header will be 256 bytes
+    # 1) write magic, which will be uint32 of "ak42" in ASCII
+    out_file.write(struct.pack('I', 0x616b3432))
+    # 2) write version, which will be int
+    out_file.write(struct.pack('i', version))
+    # 3) write the params, which will be 7 ints
+    p = model.params
+    hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+    n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                    n_kv_heads, p.vocab_size, p.max_seq_len)
+    out_file.write(header)
+    # 4) write some other flags
+    out_file.write(struct.pack('B', int(shared_classifier)))
+    out_file.write(struct.pack('i', group_size)) # group size used for quantization
+    pad = 256 - out_file.tell() # pad rest with zeros; tell returns current pos
+    assert pad >= 0
+    out_file.write(b'\0' * pad)
+    # now that the header is done, let's write out the model
+
+    # fuse rmsnorm + linear
+    with torch.no_grad():
+        for layer in model.layers:
+            attn_norm_weight = layer.attention_norm.weight
+            layer.attention.wq.weight.mul_(attn_norm_weight.unsqueeze(0))
+            layer.attention.wk.weight.mul_(attn_norm_weight.unsqueeze(0))
+            layer.attention.wv.weight.mul_(attn_norm_weight.unsqueeze(0))
+
+            ffn_norm_weight = layer.ffn_norm.weight
+            layer.feed_forward.w1.weight.mul_(ffn_norm_weight.unsqueeze(0))
+            layer.feed_forward.w3.weight.mul_(ffn_norm_weight.unsqueeze(0))
+
+            layer.attention_norm.weight.fill_(1.0)
+            layer.ffn_norm.weight.fill_(1.0)
+
+    # first let's write out all the params that we are keeping in fp32: the norms
+    for layer in model.layers: # attention norms
+        serialize_fp32(out_file, layer.attention_norm.weight)
+    for layer in model.layers: # MLP norms
+        serialize_fp32(out_file, layer.ffn_norm.weight)
+    serialize_fp32(out_file, model.norm.weight) # final pre-classifier norm
+
+
+    from hadamard_utils import matmul_hadU, random_hadamard_matrix
+    Q = random_hadamard_matrix(model.params.dim, "cpu").to(torch.float32)
+
+    with torch.no_grad():
+        model.tok_embeddings.weight.data = torch.matmul(model.tok_embeddings.weight.data, Q)
+        if not shared_classifier:
+            model.output.weight.data = torch.matmul(model.output.weight.data, Q)  # maybe wrong?
+
+        for layer in model.layers:
+            # attention
+            layer.attention.wq.weight.data = torch.matmul(layer.attention.wq.weight.data, Q)
+            layer.attention.wk.weight.data = torch.matmul(layer.attention.wk.weight.data, Q)
+
+            layer.attention.wv.weight.data = torch.matmul(layer.attention.wv.weight.data, Q)
+            head_dim = layer.attention.head_dim
+            for i in range(p.n_heads):
+                layer.attention.wv.weight.data[i*head_dim:(i+1)*head_dim, :] = matmul_hadU(layer.attention.wv.weight.data[i*head_dim:(i+1)*head_dim, :].T).T
+            
+            layer.attention.wo.weight.data = torch.matmul(Q.T, layer.attention.wo.weight.data)
+            layer.attention.wo.weight.data = matmul_hadU(layer.attention.wo.weight.data)
+
+            # feedforward
+            layer.feed_forward.w1.weight.data = torch.matmul(layer.feed_forward.w1.weight.data, Q)
+            layer.feed_forward.w3.weight.data = torch.matmul(layer.feed_forward.w3.weight.data, Q)
+            layer.feed_forward.w2.weight.data = torch.matmul(Q.T, layer.feed_forward.w2.weight.data)
+            layer.feed_forward.w2.weight.data = matmul_hadU(layer.feed_forward.w2.weight.data)
+
+    weights = [
+        model.tok_embeddings.weight,
+        *[layer.attention.wq.weight for layer in model.layers],
+        *[layer.attention.wk.weight for layer in model.layers],
+        *[layer.attention.wv.weight for layer in model.layers],
+        *[layer.attention.wo.weight for layer in model.layers],
+        *[layer.feed_forward.w1.weight for layer in model.layers],
+        *[layer.feed_forward.w2.weight for layer in model.layers],
+        *[layer.feed_forward.w3.weight for layer in model.layers],
+    ]
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+    if not shared_classifier:
+        weights.append(model.output.weight)
+    for w in weights:
+        assert w.numel() % group_size == 0, f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
+
+    # now let's write out all the params that we are quantizing to Q8_0
+    # note we skip classifier weights, which are shared with the embedding
+    ew = []
+    for i, w in enumerate(weights):
+        # quantize this weight
+        q, s, err = quantize_q80(w, group_size)
+        # save the int8 weights to file
+        serialize_int8(out_file, q) # save the tensor in int8
+        serialize_fp32(out_file, s) # save scale factors
+        # logging
+        ew.append((err, w.shape))
+        print(f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to Q8_0 with max error {err}")
+
+    # print the highest error across all weights, should be very small, e.g. O(~0.001)
+    ew.sort(reverse=True)
+    print(f"max quantization group error across all weights: {ew[0][0]}")
+
+    # write to binary file
+    out_file.close()
+    print(f"wrote {filepath}")
+
+
 def hf_export(llama_model, filepath, group_size=64, dtype=torch.float32):
     """ Generate the pytorch_model.bin state_dict and config.json for HuggingFace """
 
@@ -504,6 +631,8 @@ def model_export(model, filepath, version, dtype=torch.float32):
         version1_export(model, filepath)
     elif version == 2:
         version2_export(model, filepath)
+    elif version == 3:
+        version3_export(model, filepath)
     elif version == -1:
         hf_export(model, filepath, dtype)
     else:
